@@ -1016,6 +1016,12 @@ def revoke_certificate(conn, cert_no: str, reason: str, operator: str | None) ->
                     ],
                 )
 
+        # 已定稿 ACCEPT 且受本批撤销波及的交付归档包：各生成一份撤销风险告知
+        # （同事务、按归档冻结链判定；并发 ACCEPT 与本撤销按提交次序串行化，
+        # 签收先提交则此处读到定稿并生成告知，撤销先提交则 ACCEPT 随后被拒、
+        # 不产生定稿，自然不生成告知）。
+        _generate_revocation_notices(conn, batch["batch_id"])
+
     # 事务提交后组装返回内容
     revoked = get_certificate(conn, cert_no)
     affected = _build_invalidated_items(
@@ -1822,6 +1828,209 @@ def get_revocation_archive_impact(conn, batch_id: int, limit: int, offset: int) 
         "offset": offset,
         "items": items,
     }
+
+
+# ---------------------------------------------------------------------------
+# 撤销风险告知：已定稿 ACCEPT 的交付归档包受后续撤销波及时，由撤销事务在同一
+# 事务内生成（每 归档包×批次 一份）；收件人凭定稿邀请编号与一次性密钥查询、
+# 确认。告知只增不改，确认时刻一次性写入；不改写归档快照、签收与撤销记录。
+# ---------------------------------------------------------------------------
+
+_NOTICE_COLS = (
+    "n.notice_id, n.archive_no, n.batch_id, n.items, n.created_at, n.confirmed_at, "
+    "r.cert_no AS revoked_cert_no, r.revoked_at"
+)
+_NOTICE_FROM = (
+    "FROM delivery_revocation_notices n "
+    "JOIN revocations r ON r.batch_id = n.batch_id"
+)
+
+
+def _generate_revocation_notices(conn, batch_id: int) -> None:
+    """在撤销事务内，为已定稿 ACCEPT 且受本批撤销波及的归档包各生成一份告知。
+
+    命中判定与影响面追查同一口径：目标证书在归档时刻冻结的追溯链（归档快照
+    中的 chain.nodes，非当前状态）包含本批被撤销证书集合（被主动撤销的证书 +
+    全部级联失效证书）中任一证书。每份告知列出受影响目标（含原交付序位）及
+    其冻结链上命中的本批证书编号（含 1 起始链上序位）。同包同批只记一份
+    （(archive_no, batch_id) 唯一约束兜底）；未签收或 REJECT 的归档不生成。
+    """
+    conn.execute(
+        """
+        WITH affected AS (
+            -- 本批被撤销证书集合：被主动撤销的证书 + 级联失效的全部下游证书
+            SELECT cert_no FROM invalidations WHERE batch_id = %s
+            UNION ALL
+            SELECT cert_no FROM revocations WHERE batch_id = %s
+        ),
+        delivered AS (
+            -- 已定稿 ACCEPT 的归档包：各目标证书及其冻结追溯链（ordinality 即原交付序位）
+            SELECT d.archive_no,
+                   t.ordinality AS delivery_position,
+                   t.item ->> 'cert_no' AS cert_no,
+                   t.item -> 'chain' -> 'nodes' AS nodes
+            FROM delivery_archives d
+            JOIN delivery_receipts r
+              ON r.archive_no = d.archive_no AND r.decision = 'ACCEPT'
+            CROSS JOIN LATERAL jsonb_array_elements(d.response -> 'items')
+                 WITH ORDINALITY AS t(item, ordinality)
+        ),
+        hits AS (
+            -- 冻结链命中本批集合的目标：受影响目标及链上命中编号（序位从 1 开始）
+            SELECT dl.archive_no, dl.cert_no, dl.delivery_position,
+                   jsonb_agg(
+                       jsonb_build_object(
+                           'cert_no', n.node -> 'certificate' ->> 'cert_no',
+                           'chain_position', n.ordinality
+                       ) ORDER BY n.ordinality
+                   ) AS hits
+            FROM delivered dl
+            CROSS JOIN LATERAL jsonb_array_elements(dl.nodes)
+                 WITH ORDINALITY AS n(node, ordinality)
+            WHERE n.node -> 'certificate' ->> 'cert_no' IN (SELECT cert_no FROM affected)
+            GROUP BY dl.archive_no, dl.cert_no, dl.delivery_position
+        )
+        INSERT INTO delivery_revocation_notices (archive_no, batch_id, items)
+        SELECT h.archive_no, %s,
+               jsonb_agg(
+                   jsonb_build_object(
+                       'cert_no', h.cert_no,
+                       'delivery_position', h.delivery_position,
+                       'hits', h.hits
+                   ) ORDER BY h.delivery_position
+               )
+        FROM hits h
+        GROUP BY h.archive_no
+        ON CONFLICT (archive_no, batch_id) DO NOTHING
+        """,
+        (batch_id, batch_id, batch_id),
+    )
+
+
+def _notice_view(row: dict) -> dict:
+    return {
+        "notice_id": row["notice_id"],
+        "archive_no": row["archive_no"],
+        "batch_id": row["batch_id"],
+        "revoked_cert_no": row["revoked_cert_no"],
+        "revoked_at": row["revoked_at"],
+        "items": row["items"],
+        "created_at": row["created_at"],
+        "confirmed_at": row["confirmed_at"],
+    }
+
+
+def _notice_access(conn, invitation_no: str, key: str) -> dict:
+    """收件人访问撤销风险告知的凭据校验：定稿邀请编号 + 原一次性密钥。
+
+    - 邀请不存在 → 404 invitation_not_found；一次性密钥错误 → 401 invalid_receipt_key；
+    - 归档包尚未定稿 → 404 receipt_not_found；定稿的是同一归档的另一份邀请 →
+      409 receipt_conflict（details 给出定稿邀请编号与结论）；
+    - 邀请的截止时刻不参与判定：密钥过期不影响已签收后的查询与确认。
+    """
+    invitation = _get_invitation_row(conn, invitation_no)
+    if invitation is None:
+        raise ApiError(
+            404, "invitation_not_found", f"签收邀请不存在: {invitation_no}"
+        )
+    if not hmac.compare_digest(invitation["key_hash"], _hash_receipt_key(key)):
+        raise ApiError(
+            401,
+            "invalid_receipt_key",
+            f"一次性签收密钥错误（邀请 {invitation_no}）",
+            details={"invitation_no": invitation_no},
+        )
+    receipt = conn.execute(
+        """
+        SELECT archive_no, invitation_no, recipient, decision, reason, signed_at
+        FROM delivery_receipts WHERE archive_no = %s
+        """,
+        (invitation["archive_no"],),
+    ).fetchone()
+    if receipt is None:
+        raise ApiError(
+            404,
+            "receipt_not_found",
+            f"归档包尚无签收录制: {invitation['archive_no']}",
+            details={"archive_no": invitation["archive_no"]},
+        )
+    if receipt["invitation_no"] != invitation_no:
+        raise ApiError(
+            409,
+            "receipt_conflict",
+            f"归档包 {receipt['archive_no']} 已由邀请 {receipt['invitation_no']} 定稿："
+            "查询与确认撤销风险告知须使用定稿邀请编号及其一次性密钥",
+            details={
+                "archive_no": receipt["archive_no"],
+                "finalized_invitation_no": receipt["invitation_no"],
+                "finalized_decision": receipt["decision"],
+            },
+        )
+    return {"invitation": invitation, "receipt": receipt}
+
+
+def list_delivery_revocation_notices(conn, req) -> dict:
+    """收件人凭定稿邀请编号与一次性密钥查询本归档包的撤销风险告知列表（只读）。
+
+    REJECT 或未受任何撤销波及的归档返回空清单（total=0）；告知按 notice_id 升序。
+    """
+    access = _notice_access(conn, req.invitation_no, req.key)
+    invitation, receipt = access["invitation"], access["receipt"]
+    rows = conn.execute(
+        f"SELECT {_NOTICE_COLS} {_NOTICE_FROM} WHERE n.archive_no = %s "
+        "ORDER BY n.notice_id ASC",
+        (invitation["archive_no"],),
+    ).fetchall()
+    items = [_notice_view(r) for r in rows]
+    return {
+        "archive_no": invitation["archive_no"],
+        "invitation_no": invitation["invitation_no"],
+        "recipient": receipt["recipient"],
+        "decision": receipt["decision"],
+        "total": len(items),
+        "items": items,
+    }
+
+
+def confirm_delivery_revocation_notice(conn, notice_id: int, req) -> tuple[dict, bool]:
+    """收件人确认一份撤销风险告知，返回 (告知, 是否首次确认)。
+
+    确认一次性写入 confirmed_at（触发器强制只写一次）；重复确认（含并发确认）
+    返回首次确认时间（HTTP 200）。告知不存在、或不属于该定稿邀请对应的归档包
+    → 404 notice_not_found；凭据校验与查询一致。
+    """
+    with conn.transaction():
+        access = _notice_access(conn, req.invitation_no, req.key)
+        invitation = access["invitation"]
+        row = conn.execute(
+            f"SELECT {_NOTICE_COLS} {_NOTICE_FROM} WHERE n.notice_id = %s",
+            (notice_id,),
+        ).fetchone()
+        if row is None or row["archive_no"] != invitation["archive_no"]:
+            raise ApiError(
+                404,
+                "notice_not_found",
+                f"撤销风险告知不存在: {notice_id}",
+                details={"notice_id": notice_id},
+            )
+        confirmed = conn.execute(
+            """
+            UPDATE delivery_revocation_notices
+            SET confirmed_at = now()
+            WHERE notice_id = %s AND confirmed_at IS NULL
+            RETURNING confirmed_at
+            """,
+            (notice_id,),
+        ).fetchone()
+        if confirmed is None:
+            # 已确认过（含并发确认被阻塞后重估）：原样返回首次确认时间
+            row = conn.execute(
+                f"SELECT {_NOTICE_COLS} {_NOTICE_FROM} WHERE n.notice_id = %s",
+                (notice_id,),
+            ).fetchone()
+            return _notice_view(row), False
+        row["confirmed_at"] = confirmed["confirmed_at"]
+        return _notice_view(row), True
 
 
 # ---------------------------------------------------------------------------

@@ -72,6 +72,19 @@ CREATE TABLE IF NOT EXISTS delivery_receipts (
 );
 """,
     """
+CREATE TABLE IF NOT EXISTS delivery_revocation_notices (
+    notice_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    archive_no   TEXT NOT NULL REFERENCES delivery_archives(archive_no),
+    batch_id     BIGINT NOT NULL REFERENCES revocations(batch_id),
+    items        JSONB NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    confirmed_at TIMESTAMPTZ,
+    UNIQUE (archive_no, batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_revocation_notices_archive
+    ON delivery_revocation_notices(archive_no);
+""",
+    """
 CREATE TABLE IF NOT EXISTS cert_suspensions (
     suspension_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     cert_no       TEXT NOT NULL REFERENCES certificates(cert_no),
@@ -223,6 +236,33 @@ CREATE OR REPLACE TRIGGER trg_delivery_receipts_no_update
 CREATE OR REPLACE TRIGGER trg_delivery_receipts_no_delete
     BEFORE DELETE ON delivery_receipts
     FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+""",
+    """
+CREATE OR REPLACE FUNCTION delivery_revocation_notices_confirm_once() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'delivery_revocation_notices is append-only: %', OLD.notice_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.confirmed_at IS NOT NULL
+       OR NEW.confirmed_at IS NULL
+       OR NEW.notice_id  IS DISTINCT FROM OLD.notice_id
+       OR NEW.archive_no IS DISTINCT FROM OLD.archive_no
+       OR NEW.batch_id   IS DISTINCT FROM OLD.batch_id
+       OR NEW.items      IS DISTINCT FROM OLD.items
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'revocation notice % can only be confirmed once', OLD.notice_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_delivery_revocation_notices_confirm_once
+    BEFORE UPDATE OR DELETE ON delivery_revocation_notices
+    FOR EACH ROW EXECUTE FUNCTION delivery_revocation_notices_confirm_once();
 """,
 )
 

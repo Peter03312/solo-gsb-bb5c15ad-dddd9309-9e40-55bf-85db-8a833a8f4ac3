@@ -24,6 +24,8 @@
 - POST   /api/v1/delivery-invitations          交付方创建签收邀请（管理密钥，返回仅展示一次的随机密钥）
 - POST   /api/v1/delivery-receipts             收件人在截止前提交 ACCEPT/REJECT（每包一份定稿）
 - GET    /api/v1/delivery-archives/{archive_no}/receipt  凭管理密钥查询定稿记录
+- POST   /api/v1/delivery-revocation-notices/query           收件人凭定稿邀请编号+一次性密钥查询撤销风险告知
+- POST   /api/v1/delivery-revocation-notices/{notice_id}/confirm  收件人确认撤销风险告知（重复确认返回首次确认时间）
 - GET    /api/v1/devices/{device_id}/certificates  某设备全部证书（含历史）
 - GET    /api/v1/devices/{device_id}/coverage-audit  设备校准覆盖审计（合规/空窗片段）
 - GET    /api/v1/revocations                   撤销批次列表
@@ -49,6 +51,9 @@ from .schemas import (
     DeliveryInvitationResponse,
     DeliveryReceiptRequest,
     DeliveryReceiptResponse,
+    DeliveryRevocationNoticeAccessRequest,
+    DeliveryRevocationNoticeListOut,
+    DeliveryRevocationNoticeOut,
     ReferenceIssueRequest,
     RevokeRequest,
 )
@@ -354,6 +359,50 @@ def get_delivery_receipt(
     """
     with pool.connection() as conn:
         return repo.get_delivery_receipt(conn, archive_no, x_management_key)
+
+
+@router.post(
+    "/delivery-revocation-notices/query",
+    response_model=DeliveryRevocationNoticeListOut,
+)
+def query_delivery_revocation_notices(
+    req: DeliveryRevocationNoticeAccessRequest,
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """收件人凭定稿邀请编号与一次性密钥查询本归档包的撤销风险告知列表。
+
+    已定稿 ACCEPT 的归档包受后续撤销波及时，撤销事务在同一事务内为该包生成
+    一份告知（列出撤销批次、受影响目标及链上命中编号；同包同批只记一份，
+    未签收或 REJECT 不生成）。密钥过期不影响已签收后的查询；邀请未知
+    404 invitation_not_found、密钥错误 401 invalid_receipt_key、尚未定稿
+    404 receipt_not_found、非定稿邀请 409 receipt_conflict。
+    """
+    with pool.connection() as conn:
+        return repo.list_delivery_revocation_notices(conn, req)
+
+
+@router.post(
+    "/delivery-revocation-notices/{notice_id}/confirm",
+    status_code=201,
+    response_model=DeliveryRevocationNoticeOut,
+)
+def confirm_delivery_revocation_notice(
+    notice_id: int,
+    req: DeliveryRevocationNoticeAccessRequest,
+    response: Response,
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """收件人凭定稿邀请编号与一次性密钥确认一份撤销风险告知。
+
+    首次确认 201 并写入确认时刻（一次性写入，触发器强制）；重复确认返回
+    200 与首次确认时间。告知不存在或不属于该定稿邀请对应的归档包
+    404 notice_not_found；凭据校验与查询一致（密钥过期不影响确认）。
+    """
+    with pool.connection() as conn:
+        body, created = repo.confirm_delivery_revocation_notice(conn, notice_id, req)
+    if not created:
+        response.status_code = 200
+    return body
 
 
 @router.get("/devices/{device_id}/certificates")

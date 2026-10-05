@@ -49,10 +49,14 @@ app = FastAPI(
         "申请号幂等、驳回后不可再批准、并发复核只允许一份定稿，可按申请号查询状态与结果；"
         "支持按撤销批次追查已交付归档凭据的影响面（冻结链命中本批被撤销证书的"
         "归档包与包内目标证书，分页输出）；"
+        "已定稿 ACCEPT 的交付归档包受后续撤销波及时，撤销事务在同一事务内按归档"
+        "冻结链为该包生成一份撤销风险告知（撤销批次、受影响目标及链上命中编号，"
+        "同包同批一份，未签收或 REJECT 不生成）；收件人凭定稿邀请编号与一次性密钥"
+        "查询、确认告知（密钥过期不影响已签收后的确认，重复确认返回首次确认时间）；"
         "支持按设备审计过去半开区间内的校准覆盖：按时间顺序返回完整、无重叠的"
         "合规/空窗片段，合规片段列出当时可用的合格普通证书编号。"
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -112,6 +116,8 @@ def index():
             "POST /api/v1/delivery-invitations",
             "POST /api/v1/delivery-receipts",
             "GET  /api/v1/delivery-archives/{archive_no}/receipt",
+            "POST /api/v1/delivery-revocation-notices/query",
+            "POST /api/v1/delivery-revocation-notices/{notice_id}/confirm",
             "GET  /api/v1/devices/{device_id}/certificates",
             "GET  /api/v1/devices/{device_id}/coverage-audit",
             "GET  /api/v1/revocations",

@@ -402,6 +402,60 @@ class DeliveryReceiptResponse(BaseModel):
     signed_at: datetime
 
 
+class DeliveryRevocationNoticeAccessRequest(BaseModel):
+    """收件人查询/确认撤销风险告知：定稿邀请编号 + 创建邀请时一次性展示的随机密钥。
+
+    邀请的截止时刻不参与判定：密钥过期不影响已签收后的查询与确认；
+    密钥错误一律拒绝（401 invalid_receipt_key）。
+    """
+    invitation_no: str = Field(..., min_length=1, max_length=128, description="定稿邀请编号")
+    key: str = Field(
+        ..., min_length=1, max_length=256,
+        description="创建邀请时仅展示一次的随机密钥（明文不落库，按 SHA-256 校验）",
+    )
+
+
+class RevocationNoticeHit(BaseModel):
+    """冻结追溯链上的一次命中：本批被撤销（含级联失效）证书及其链上序位。"""
+    cert_no: str = Field(..., description="本批被撤销/级联失效且在冻结链上命中的证书编号")
+    chain_position: int = Field(..., description="命中证书在冻结追溯链中的序位（链首基准为 1）")
+
+
+class RevocationNoticeItem(BaseModel):
+    """一份告知中的一个受影响目标证书及其冻结链命中明细。"""
+    cert_no: str = Field(..., description="受影响的包内目标证书编号")
+    delivery_position: int = Field(..., description="原交付序位（提交列表中的位置，从 1 开始）")
+    hits: list[RevocationNoticeHit] = Field(
+        ..., description="该目标冻结追溯链上的命中编号（按链上序位升序）"
+    )
+
+
+class DeliveryRevocationNoticeOut(BaseModel):
+    """撤销风险告知：一次撤销对一份已签收（ACCEPT）归档包的影响，收件人可确认。"""
+    notice_id: int
+    archive_no: str
+    batch_id: int = Field(..., description="撤销批次号")
+    revoked_cert_no: str = Field(..., description="本批被主动撤销的证书编号")
+    revoked_at: datetime = Field(..., description="撤销时刻")
+    items: list[RevocationNoticeItem] = Field(
+        ..., description="受影响目标及链上命中编号（按原交付序位升序）"
+    )
+    created_at: datetime = Field(..., description="告知生成时刻（撤销事务提交时点）")
+    confirmed_at: datetime | None = Field(
+        None, description="收件人确认时刻；未确认为 null（确认一次性写入）"
+    )
+
+
+class DeliveryRevocationNoticeListOut(BaseModel):
+    """收件人视角的告知清单：定稿信息 + 本归档包的全部撤销风险告知。"""
+    archive_no: str
+    invitation_no: str
+    recipient: str
+    decision: Literal["ACCEPT", "REJECT"] = Field(..., description="定稿结论")
+    total: int
+    items: list[DeliveryRevocationNoticeOut]
+
+
 class SuspensionEventOut(BaseModel):
     """一次停用/解除事件（停用登记或复核解除，按登记时间升序）。"""
     suspension_id: int

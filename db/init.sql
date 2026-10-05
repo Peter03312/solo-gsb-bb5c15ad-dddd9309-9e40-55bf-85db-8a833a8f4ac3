@@ -164,6 +164,26 @@ CREATE TABLE delivery_receipts (
 );
 
 -- ----------------------------------------------------------------------------
+-- 撤销风险告知表：已定稿 ACCEPT 的交付归档包受后续证书撤销波及时，由撤销事务
+-- 在同一事务内按归档时刻冻结的追溯链判定命中并生成（每 归档包×撤销批次 至多
+-- 一份，唯一约束兜底；未签收或 REJECT 的归档不生成）。items 为生成时刻快照：
+-- 受影响目标（含原交付序位）及其冻结链上命中的本批证书编号（含 1 起始链上
+-- 序位）。confirmed_at 为收件人确认时刻，由确认一次性写入（触发器强制），
+-- 重复确认返回首次确认时间。本表只增不改。
+-- ----------------------------------------------------------------------------
+CREATE TABLE delivery_revocation_notices (
+    notice_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    archive_no   TEXT NOT NULL REFERENCES delivery_archives(archive_no),
+    batch_id     BIGINT NOT NULL REFERENCES revocations(batch_id),
+    items        JSONB NOT NULL,                 -- 受影响目标及链上命中编号（生成时刻快照）
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    confirmed_at TIMESTAMPTZ,                    -- 收件人确认时刻（确认后一次性写入）
+    UNIQUE (archive_no, batch_id)                -- 同包同批只记一份
+);
+CREATE INDEX idx_delivery_revocation_notices_archive
+    ON delivery_revocation_notices(archive_no);
+
+-- ----------------------------------------------------------------------------
 -- 更正声明表：针对已签发证书的展示字段（设备名称/操作员/备注）登记更正声明。
 -- declaration_no 为幂等键（全局唯一）；seq 为同一证书内按成功登记顺序分配的
 -- 序号（从 1 开始），合并展示时按 seq 升序逐条覆盖生效。corrections 仅保存
@@ -348,6 +368,33 @@ CREATE TRIGGER trg_delivery_receipts_no_update
 CREATE TRIGGER trg_delivery_receipts_no_delete
     BEFORE DELETE ON delivery_receipts
     FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+
+-- 撤销风险告知只增不改：仅允许“收件人确认”这一次性 UPDATE（confirmed_at 由
+-- 空写入一次），告知内容（归档包/批次/命中明细/生成时刻）一律不可改；DELETE 禁止。
+CREATE OR REPLACE FUNCTION delivery_revocation_notices_confirm_once() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'delivery_revocation_notices is append-only: %', OLD.notice_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.confirmed_at IS NOT NULL
+       OR NEW.confirmed_at IS NULL
+       OR NEW.notice_id  IS DISTINCT FROM OLD.notice_id
+       OR NEW.archive_no IS DISTINCT FROM OLD.archive_no
+       OR NEW.batch_id   IS DISTINCT FROM OLD.batch_id
+       OR NEW.items      IS DISTINCT FROM OLD.items
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'revocation notice % can only be confirmed once', OLD.notice_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_delivery_revocation_notices_confirm_once
+    BEFORE UPDATE OR DELETE ON delivery_revocation_notices
+    FOR EACH ROW EXECUTE FUNCTION delivery_revocation_notices_confirm_once();
 
 -- 停用记录仅允许“解除停用”这一次性 UPDATE：从生效中（lifted_at 为 NULL）
 -- 变为已解除（lifted_at/lift_reason 写入），其余列一律不可改；DELETE 禁止。
