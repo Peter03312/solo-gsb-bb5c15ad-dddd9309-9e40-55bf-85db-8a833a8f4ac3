@@ -210,6 +210,28 @@ class DeliveryReceiptRequest(BaseModel):
     )
 
 
+class DeliveryRiskNoticeQueryRequest(BaseModel):
+    """收件人查询撤销风险告知：定稿邀请编号 + 原一次性密钥。
+
+    已签收（定稿 ACCEPT）的归档包若受撤销波及，撤销事务已为其生成风险告知；
+    收件人凭创建邀请时一次性展示的随机密钥查询。密钥过期（邀请截止）不影响
+    已签收后的查询与确认；密钥错误拒绝。
+    """
+    invitation_no: str = Field(..., min_length=1, max_length=128, description="定稿邀请编号")
+    key: str = Field(..., min_length=1, max_length=256, description="创建邀请时仅展示一次的随机密钥")
+
+
+class DeliveryRiskNoticeAckRequest(BaseModel):
+    """收件人确认一份撤销风险告知：重复确认返回首次确认时间（告知只确认一次）。
+
+    凭定稿邀请编号与原一次性密钥确认；密钥过期不影响已签收后的确认。
+    notice_id 取自查询响应；告知不存在或不属于该邀请的归档包时拒绝。
+    """
+    invitation_no: str = Field(..., min_length=1, max_length=128, description="定稿邀请编号")
+    key: str = Field(..., min_length=1, max_length=256, description="创建邀请时仅展示一次的随机密钥")
+    notice_id: int = Field(..., ge=1, description="告知编号（查询响应中给出）")
+
+
 class CertificateOut(BaseModel):
     cert_no: str
     kind: CertKind

@@ -12,7 +12,11 @@
 密钥（明文不落库）；收件人在截止前提交 `ACCEPT`/`REJECT`（拒收须填原因），
 **每个归档包只允许一份定稿**，同邀请同内容重试（截止后亦然）返回首次结果；
 `ACCEPT` 时若包内目标或其冻结追溯链中已有证书被撤销/失效则拒绝并点名受影响
-目标，定稿记录可凭管理密钥查询。
+目标，定稿记录可凭管理密钥查询。已签收（定稿 `ACCEPT`）的归档包若事后受
+证书撤销波及，撤销事务会按归档时刻冻结的追溯链为其生成一份**撤销风险告知**
+（撤销批次、受影响目标及链上命中编号；同包同批只记一份，未签收或 `REJECT`
+不生成）；收件人凭定稿邀请编号与原一次性密钥查询、确认告知，密钥过期不影响
+已签收后的确认，重复确认返回首次确认时间。
 计量人员发现标准证书有待复核时，可凭管理密钥登记**临时停用**（非空原因），
 停用从登记成功时刻起生效：停用期间新签发普通证书不得以该证书或其任何下游
 证书为追溯依据（单张与交接批次、批内引用均强制校验，命中整批不落库）；
@@ -44,7 +48,7 @@
 │   ├── db.py            # 连接池
 │   ├── config.py        # 环境变量配置
 │   └── errors.py        # 统一业务错误
-├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、批次/更正/交付归档/签收/停用/复核申请表）
+├── db/init.sql          # 数据库初始化（枚举、约束、触发器、视图、批次/更正/交付归档/签收/风险告知/停用/复核申请表）
 ├── scripts/             # 冒烟测试脚本（可直接对运行中的服务执行）
 ├── Dockerfile
 ├── docker-compose.yml
@@ -300,6 +304,30 @@ DB_HOST=127.0.0.1 DB_PORT=5432 DB_NAME=caltrace DB_USER=caltrace DB_PASSWORD=sec
     - **不影响既有通道**：直接签发（`POST /api/v1/certificates`）、批次
       签发与全部证书查询/撤销契约保持不变；批准签发的证书与直接签发的
       证书在证书表中完全同形，可正常查询、撤销与级联失效。
+16. **撤销风险告知（已签收归档的可追认告知）**：
+    - **生成**：每次撤销在**同一撤销事务内**，按归档时刻冻结的追溯链
+      （归档快照，非当前状态），为**已定稿 ACCEPT 且受该批撤销影响**的
+      每个归档包生成一份告知——包内目标的冻结链包含本批被撤销证书集合
+      （被主动撤销的证书 + 全部级联失效证书）中任一证书即受影响。告知
+      列出撤销批次、受影响目标（含原交付序位）及**链上命中编号**（冻结链
+      上命中本批集合的证书编号及其序位，均从 1 开始）。**同包同批只记
+      一份**（`UNIQUE (archive_no, batch_id)` 强制）；未签收（无定稿）或
+      `REJECT` 的归档不生成。
+    - **查询与确认**：收件人凭**定稿邀请编号 + 原一次性密钥**查询归档包的
+      全部告知、确认单份告知；邀请未知 `404 invitation_not_found`、密钥
+      错误 `401 invalid_receipt_key`、告知不存在或不属于该邀请的归档包
+      `404 notice_not_found`。**密钥过期（邀请截止）不影响已签收后的
+      查询与确认**——签收定稿后告知通道持续有效。确认只生效一次：首次
+      确认写入确认时刻（`201`），**重复确认返回首次确认时间**（`200`，
+      内容不变）；并发确认由告知行锁串行化，恰一份为首次。
+    - **并发次序**：签收与撤销并发按**提交先后**决定——`ACCEPT` 先提交
+      则撤销事务可见该定稿并生成告知；撤销先提交则 `ACCEPT` 按现有规则
+      `422 receipt_targets_revoked` 拒绝、不留定稿，也就不会生成告知。
+      告知在撤销事务内生成，与撤销批次同事务落库，不会出现"撤销已生效
+      而告知缺失"的窗口。
+    - **只增不改**：告知内容（批次、受影响明细、生成时刻）一经写入不可
+      改写、不可删除；`acknowledged_at` 只允许 `NULL → 非空` 一次性写入
+      （数据库触发器强制）。归档快照、签收定稿与撤销接口的既有行为不变。
 
 证书状态：`ACTIVE` 生效中 / `REVOKED` 被主动撤销 / `INVALID` 因上游撤销级联失效。
 
@@ -1079,6 +1107,90 @@ curl -sS http://localhost:8080/api/v1/certificates/REF-MASTER-001/suspensions \
 `ACTIVE/REVOKED/INVALID` 状态不变（撤销与停用互不改写，可并存），
 撤销批次与级联失效记录不变，已冻结交付归档快照与批次首次签发快照不变。
 
+### 25. 查询撤销风险告知（收件人，定稿邀请编号 + 一次性密钥）
+
+已签收（定稿 `ACCEPT`）的归档包若事后受证书撤销波及，撤销事务已按归档时刻
+冻结的追溯链为其生成风险告知（同包同批只记一份；未签收或 `REJECT` 不生成）。
+收件人凭**定稿邀请编号 + 创建邀请时一次性展示的随机密钥**查询——不需要管理
+密钥；**密钥过期（邀请截止）不影响已签收后的查询**：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/delivery-risk-notices/query \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "invitation_no": "DINV-9f2c1a7b3e6d4850",
+    "key": "Yk8-3pQ7sV2xR9mN4bL6tW0cF5hJ1dG8uZaX7eKoMnA"
+  }' | python3 -m json.tool
+```
+
+响应 `200`：该邀请对应归档包的全部告知，按生成顺序（`notice_id` 升序）；
+无撤销波及（或未签收/已拒收）时 `notices` 为空列表：
+
+```json
+{
+  "invitation_no": "DINV-9f2c1a7b3e6d4850",
+  "archive_no": "DELIVERY-2026-10-03-001",
+  "recipient": "某某检测有限公司-质检部",
+  "notices": [
+    {
+      "notice_id": 1,
+      "archive_no": "DELIVERY-2026-10-03-001",
+      "batch_id": 1,
+      "revoked_cert_no": "REF-MASTER-001",
+      "revoked_at": "2026-10-05T02:10:00.123456+00:00",
+      "affected_targets": [
+        {
+          "cert_no": "CAL-WS-001",
+          "delivery_position": 1,
+          "chain_hits": [{"cert_no": "REF-MASTER-001", "chain_position": 1}]
+        },
+        {
+          "cert_no": "CAL-CUS-001",
+          "delivery_position": 2,
+          "chain_hits": [{"cert_no": "REF-MASTER-001", "chain_position": 1}]
+        }
+      ],
+      "created_at": "2026-10-05T02:10:00.123456+00:00",
+      "acknowledged_at": null
+    }
+  ]
+}
+```
+
+每份告知列出：**撤销批次**（`batch_id` / `revoked_cert_no` / `revoked_at`）、
+**受影响目标**（包内目标证书编号 + 原交付序位 `delivery_position`）及
+**链上命中编号**（`chain_hits`：冻结追溯链上命中本批被撤销证书集合——被主动
+撤销的证书与全部级联失效证书——的证书编号及其链上序位 `chain_position`，
+两种序位均从 1 开始）；`acknowledged_at` 为 `null` 表示尚未确认。
+
+拒绝场景：邀请未知 `404 invitation_not_found`、一次性密钥错误
+`401 invalid_receipt_key`。
+
+### 26. 确认撤销风险告知（收件人，可追认）
+
+收件人阅读告知后，凭同一邀请编号与一次性密钥确认单份告知（`notice_id` 取自
+查询响应）。确认是**可追认**的：重复确认不会报错，原样返回**首次确认时间**：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/delivery-risk-notices/acknowledge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "invitation_no": "DINV-9f2c1a7b3e6d4850",
+    "key": "Yk8-3pQ7sV2xR9mN4bL6tW0cF5hJ1dG8uZaX7eKoMnA",
+    "notice_id": 1
+  }' | python3 -m json.tool
+```
+
+- 首次确认响应 `201`，返回该告知并写入 `acknowledged_at`（确认时刻）；
+- **重复确认**（同一邀请同一告知）响应 `200`，`acknowledged_at` 恒为**首次
+  确认时间**，其余内容不变；并发确认由告知行锁串行化，恰一份为首次；
+- 告知不存在、或不属于该邀请的归档包 → `404 notice_not_found`；
+- 邀请未知 `404 invitation_not_found`、密钥错误 `401 invalid_receipt_key`；
+  **密钥过期（邀请截止）不影响已签收后的确认**。
+
+告知与确认记录只增不改：告知内容（批次、受影响明细、生成时刻）一经写入不可
+改写，`acknowledged_at` 只允许一次性写入（数据库触发器强制）。
+
 ---
 
 ## 错误响应
@@ -1087,7 +1199,7 @@ curl -sS http://localhost:8080/api/v1/certificates/REF-MASTER-001/suspensions \
 
 | HTTP | code | 触发场景 |
 | --- | --- | --- |
-| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` / `archive_not_found` / `invitation_not_found` / `receipt_not_found` | 目标不存在（`receipt_not_found`：归档包存在但尚未定稿） |
+| 404 | `cert_not_found` / `device_not_found` / `revocation_not_found` / `batch_not_found` / `declaration_not_found` / `archive_not_found` / `invitation_not_found` / `receipt_not_found` / `notice_not_found` | 目标不存在（`receipt_not_found`：归档包存在但尚未定稿；`notice_not_found`：告知不存在或不属于该邀请的归档包） |
 | 401 | `invalid_management_key` | 创建签收邀请、查询定稿记录，或登记/解除/查询标准证书停用时 `X-Management-Key` 缺失/错误 |
 | 401 | `invalid_identity_key` | 提交复核申请时 `X-Entry-Key`、驳回/批准/查询复核时 `X-Reviewer-Key`（或录入凭据）缺失/无效（两角色凭据不通用） |
 | 403 | `reviewer_must_differ` | 复核人与录入人使用了同一把身份凭据（普通证书签发须双人复核） |
@@ -1097,7 +1209,7 @@ curl -sS http://localhost:8080/api/v1/certificates/REF-MASTER-001/suspensions \
 | 422 | `review_reason_required` | 驳回（REJECT）未填写或仅空白的驳回原因 |
 | 422 | `review_approve_reason_not_allowed` | 批准（APPROVE）请求携带了驳回原因 |
 | 409 | `review_busy` | 批准与并发停用/撤销竞争且死锁重试耗尽（申请仍为待审，可重试） |
-| 401 | `invalid_receipt_key` | 提交签收时一次性密钥错误 |
+| 401 | `invalid_receipt_key` | 提交签收、查询或确认撤销风险告知时一次性密钥错误 |
 | 409 | `suspension_conflict` | 证书已存在生效中的临时停用记录，重复停用被拒 |
 | 409 | `suspension_not_active` | 证书没有生效中的临时停用记录（重复/并发解除） |
 | 409 | `cert_not_active` | 撤销一张非 ACTIVE 证书，或对非生效（含已撤销/失效）证书登记停用 |
@@ -1152,6 +1264,7 @@ python3 scripts/receipt_checks.py     # 交付签收：邀请一次性密钥/截
 python3 scripts/coverage_checks.py    # 覆盖审计：计入窗口/撤销与级联截断/重签还原/空窗/参数错误
 python3 scripts/suspension_checks.py  # 标准证书临时停用：登记/解除/查询/受阻链单张与批次拦截/不改写/提交次序并发
 python3 scripts/review_checks.py      # 普通证书双人复核：凭据/待审不占用/驳回不可再批准/批准按当时规则真正签发/失败仍待审/幂等与并发定稿/契约不变
+python3 scripts/notice_checks.py      # 撤销风险告知：生成/同包同批一份/未签收与REJECT不生成/查询确认/过期密钥/并发次序
 ```
 
 覆盖：基准登记、多级签发、无效引用、越界校准时刻、区间重叠（含首尾相接）、
@@ -1222,3 +1335,13 @@ REJECTED 绑定结论/复核人/原因/时刻且不产生证书、驳回后再�
 定稿（恰一份 201 其余 409、最终状态与胜方一致、批准胜方只签一张证书/
 驳回胜方不产生证书）、8 路同复核人同操作并发（1×201 其余 200 且响应
 全等），以及既有直接签发/查询/撤销/追溯链契约与根索引端点清单不变。
+撤销风险告知的生成（已定稿 ACCEPT 归档按冻结链命中本批被撤销/级联失效
+证书，告知列出撤销批次、受影响目标与原交付序位、链上命中编号及 1 起始
+序位，多级链同时命中被撤销与级联失效证书）、同包同批只记一份且重复查询
+稳定、未签收与 REJECT 归档不生成、两次撤销波及同一包生成两份告知、
+查询/确认的邀请与一次性密钥校验（未知邀请 404、错误密钥 401、未知或
+跨邀请告知 404）、首次确认 201 与重复确认返回首次确认时间（200 且内容
+不变）、邀请截止（密钥过期）后仍可查询与确认、16 组链签收×撤销并发按
+提交次序判定（先签收生成一份告知、先撤销 ACCEPT 422 且无告知）、同一
+告知 10 路并发确认（1×201 其余 200 且确认时刻全同），以及既有归档快照、
+定稿记录、证书详情、撤销响应契约与根索引端点清单不变。

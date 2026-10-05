@@ -224,6 +224,47 @@ CREATE OR REPLACE TRIGGER trg_delivery_receipts_no_delete
     BEFORE DELETE ON delivery_receipts
     FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
 """,
+    """
+CREATE TABLE IF NOT EXISTS delivery_risk_notices (
+    notice_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    archive_no   TEXT NOT NULL,
+    batch_id     BIGINT NOT NULL REFERENCES revocations(batch_id),
+    affected     JSONB NOT NULL,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    acknowledged_at TIMESTAMPTZ,
+    UNIQUE (archive_no, batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_risk_notices_archive
+    ON delivery_risk_notices(archive_no);
+""",
+    """
+CREATE OR REPLACE FUNCTION delivery_risk_notices_ack_only() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'delivery_risk_notices is append-only: %', OLD.notice_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.acknowledged_at IS NOT NULL
+       OR NEW.acknowledged_at IS NULL
+       OR NEW.notice_id  IS DISTINCT FROM OLD.notice_id
+       OR NEW.archive_no IS DISTINCT FROM OLD.archive_no
+       OR NEW.batch_id   IS DISTINCT FROM OLD.batch_id
+       OR NEW.affected   IS DISTINCT FROM OLD.affected
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'delivery_risk_notices rows can only be acknowledged once (notice_id=%)',
+            OLD.notice_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+""",
+    """
+CREATE OR REPLACE TRIGGER trg_delivery_risk_notices_ack_only
+    BEFORE UPDATE OR DELETE ON delivery_risk_notices
+    FOR EACH ROW EXECUTE FUNCTION delivery_risk_notices_ack_only();
+""",
 )
 
 

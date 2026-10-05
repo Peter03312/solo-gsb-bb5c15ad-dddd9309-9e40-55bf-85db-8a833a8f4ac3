@@ -24,6 +24,8 @@
 - POST   /api/v1/delivery-invitations          交付方创建签收邀请（管理密钥，返回仅展示一次的随机密钥）
 - POST   /api/v1/delivery-receipts             收件人在截止前提交 ACCEPT/REJECT（每包一份定稿）
 - GET    /api/v1/delivery-archives/{archive_no}/receipt  凭管理密钥查询定稿记录
+- POST   /api/v1/delivery-risk-notices/query        收件人凭定稿邀请编号+一次性密钥查询撤销风险告知
+- POST   /api/v1/delivery-risk-notices/acknowledge  收件人确认撤销风险告知（重复确认返回首次确认时间）
 - GET    /api/v1/devices/{device_id}/certificates  某设备全部证书（含历史）
 - GET    /api/v1/devices/{device_id}/coverage-audit  设备校准覆盖审计（合规/空窗片段）
 - GET    /api/v1/revocations                   撤销批次列表
@@ -49,6 +51,8 @@ from .schemas import (
     DeliveryInvitationResponse,
     DeliveryReceiptRequest,
     DeliveryReceiptResponse,
+    DeliveryRiskNoticeAckRequest,
+    DeliveryRiskNoticeQueryRequest,
     ReferenceIssueRequest,
     RevokeRequest,
 )
@@ -354,6 +358,40 @@ def get_delivery_receipt(
     """
     with pool.connection() as conn:
         return repo.get_delivery_receipt(conn, archive_no, x_management_key)
+
+
+@router.post("/delivery-risk-notices/query")
+def query_delivery_risk_notices(
+    req: DeliveryRiskNoticeQueryRequest, pool: ConnectionPool = Depends(pool_dep)
+):
+    """收件人凭定稿邀请编号 + 原一次性密钥查询归档包的全部撤销风险告知。
+
+    已签收（定稿 ACCEPT）的归档包受撤销波及时，撤销事务已按归档时刻冻结的
+    追溯链为其生成告知（撤销批次、受影响目标及链上命中编号）。密钥过期
+    （邀请截止）不影响已签收后的查询；邀请未知 404 invitation_not_found、
+    密钥错误 401 invalid_receipt_key。
+    """
+    with pool.connection() as conn:
+        return repo.query_delivery_risk_notices(conn, req)
+
+
+@router.post("/delivery-risk-notices/acknowledge", status_code=201)
+def acknowledge_delivery_risk_notice(
+    req: DeliveryRiskNoticeAckRequest,
+    response: Response,
+    pool: ConnectionPool = Depends(pool_dep),
+):
+    """收件人确认一份撤销风险告知（凭定稿邀请编号 + 原一次性密钥）。
+
+    首次确认 201 并写入确认时刻；重复确认 200 返回首次确认时间。
+    告知不存在或不属于该邀请的归档包 404 notice_not_found；
+    密钥错误 401 invalid_receipt_key；密钥过期不影响确认。
+    """
+    with pool.connection() as conn:
+        body, created = repo.acknowledge_delivery_risk_notice(conn, req)
+    if not created:
+        response.status_code = 200
+    return body
 
 
 @router.get("/devices/{device_id}/certificates")

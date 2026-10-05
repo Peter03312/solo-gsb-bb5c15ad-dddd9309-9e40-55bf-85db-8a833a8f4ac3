@@ -37,6 +37,10 @@ app = FastAPI(
         "返回邀请编号与仅展示一次的随机密钥（明文不落库）；收件人截止前提交 ACCEPT/REJECT，"
         "每包一份定稿、同邀请同内容重试返回首次结果，ACCEPT 时目标或冻结链证书已撤销/"
         "失效则拒绝并点名，定稿可凭管理密钥查询；"
+        "支持撤销风险告知：已签收（定稿 ACCEPT）的归档包受撤销波及时，撤销事务按归档"
+        "时刻冻结的追溯链为其生成告知（撤销批次、受影响目标及链上命中编号，同包同批"
+        "只记一份，未签收或 REJECT 不生成）；收件人凭定稿邀请编号与原一次性密钥查询、"
+        "确认告知，密钥过期不影响已签收后的确认，重复确认返回首次确认时间；"
         "支持标准证书临时停用：计量人员凭管理密钥对待复核的生效标准证书登记停用"
         "（非空原因，登记成功时刻起生效），停用期间该证书及任何下游证书不得作为新签发"
         "普通证书的追溯依据（单张与交接批次、批内引用均校验，命中整批不落库），"
@@ -52,7 +56,7 @@ app = FastAPI(
         "支持按设备审计过去半开区间内的校准覆盖：按时间顺序返回完整、无重叠的"
         "合规/空窗片段，合规片段列出当时可用的合格普通证书编号。"
     ),
-    version="1.8.0",
+    version="1.9.0",
     lifespan=lifespan,
 )
 
@@ -112,6 +116,8 @@ def index():
             "POST /api/v1/delivery-invitations",
             "POST /api/v1/delivery-receipts",
             "GET  /api/v1/delivery-archives/{archive_no}/receipt",
+            "POST /api/v1/delivery-risk-notices/query",
+            "POST /api/v1/delivery-risk-notices/acknowledge",
             "GET  /api/v1/devices/{device_id}/certificates",
             "GET  /api/v1/devices/{device_id}/coverage-audit",
             "GET  /api/v1/revocations",

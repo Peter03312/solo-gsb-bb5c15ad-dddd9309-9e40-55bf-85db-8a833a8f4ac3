@@ -1016,6 +1016,13 @@ def revoke_certificate(conn, cert_no: str, reason: str, operator: str | None) ->
                     ],
                 )
 
+        # 为已定稿 ACCEPT 且受本批撤销影响的交付归档包各生成一份风险告知
+        # （同包同批只记一份；未签收或 REJECT 不生成）。必须在撤销事务内生成：
+        # 受影响归档的并发 ACCEPT 与本事务在证书行锁上互斥，其定稿要么已提交
+        # （对本语句可见，生成告知），要么被阻塞到本事务提交后按既有规则 422
+        # 拒绝（不留定稿，永不生成）——按实际提交次序判定，无遗漏。
+        _generate_delivery_risk_notices(conn, batch["batch_id"])
+
     # 事务提交后组装返回内容
     revoked = get_certificate(conn, cert_no)
     affected = _build_invalidated_items(
@@ -1822,6 +1829,197 @@ def get_revocation_archive_impact(conn, batch_id: int, limit: int, offset: int) 
         "offset": offset,
         "items": items,
     }
+
+
+# ---------------------------------------------------------------------------
+# 撤销风险告知：已签收（定稿 ACCEPT）的交付归档受撤销波及时，撤销事务按归档
+# 时刻冻结的追溯链为每个受影响归档包生成一份可追认的告知（同包同批只记一份）。
+# 收件人凭定稿邀请编号与原一次性密钥查询、确认；密钥过期不影响已签收后的
+# 确认，重复确认返回首次确认时间。告知表只增不改（确认时刻一次性写入）。
+# ---------------------------------------------------------------------------
+
+_NOTICE_COLS = "notice_id, archive_no, batch_id, affected, created_at, acknowledged_at"
+
+
+def _generate_delivery_risk_notices(conn, batch_id: int) -> None:
+    """在撤销事务内，为已定稿 ACCEPT 且受本批撤销影响的归档包各生成一份告知。
+
+    - 影响判定按归档时刻冻结的追溯链（归档快照 response.items[].chain.nodes，
+      非当前状态）：冻结链包含本批被撤销证书集合（被主动撤销的证书 + 全部
+      级联失效证书）中任一证书的包内目标即受影响；链上命中编号及其在冻结链
+      中的序位（从 1 开始）一并记录；
+    - 同包同批只记一份（UNIQUE (archive_no, batch_id) 兜底）；未签收（无定稿）
+      或 REJECT 的归档不生成；
+    - 并发：受影响归档的 ACCEPT 事务对同一证书链持 FOR SHARE 锁，与本事务的
+      FOR UPDATE 互斥——ACCEPT 先提交则其定稿对本语句可见（生成告知），
+      本事务先提交则该 ACCEPT 随后按既有规则被 422 拒绝（不留定稿、不生成），
+      按实际提交次序判定。delivery_risk_notices 不引用 delivery_archives
+      （无外键），本语句不需要归档行锁，与签收事务的加锁顺序（归档行
+      FOR UPDATE -> 证书链 FOR SHARE）不会形成等待环。
+    """
+    conn.execute(
+        """
+        WITH affected AS (
+            -- 本批被撤销证书集合：被主动撤销的证书 + 级联失效的全部下游证书
+            SELECT cert_no FROM invalidations WHERE batch_id = %s
+            UNION ALL
+            SELECT cert_no FROM revocations WHERE batch_id = %s
+        ),
+        accepted AS (
+            -- 已定稿 ACCEPT 的归档包（每包至多一份定稿）
+            SELECT d.archive_no, d.response
+            FROM delivery_archives d
+            JOIN delivery_receipts r ON r.archive_no = d.archive_no
+            WHERE r.decision = 'ACCEPT'
+        ),
+        targets AS (
+            -- 各包内目标及其冻结追溯链；ordinality 即原交付序位（从 1 开始）
+            SELECT a.archive_no,
+                   t.ordinality AS delivery_position,
+                   t.item ->> 'cert_no' AS cert_no,
+                   t.item -> 'chain' -> 'nodes' AS nodes
+            FROM accepted a
+            CROSS JOIN LATERAL jsonb_array_elements(a.response -> 'items')
+                 WITH ORDINALITY AS t(item, ordinality)
+        ),
+        hits AS (
+            -- 冻结链命中本批集合的目标：链上命中编号及其序位（从 1 开始）
+            SELECT t.archive_no, t.cert_no, t.delivery_position,
+                   jsonb_agg(
+                       jsonb_build_object(
+                           'cert_no', n.node -> 'certificate' ->> 'cert_no',
+                           'chain_position', n.ordinality
+                       ) ORDER BY n.ordinality
+                   ) AS chain_hits
+            FROM targets t
+            CROSS JOIN LATERAL jsonb_array_elements(t.nodes)
+                 WITH ORDINALITY AS n(node, ordinality)
+            WHERE n.node -> 'certificate' ->> 'cert_no' IN (SELECT cert_no FROM affected)
+            GROUP BY t.archive_no, t.cert_no, t.delivery_position
+        )
+        INSERT INTO delivery_risk_notices (archive_no, batch_id, affected)
+        SELECT h.archive_no, %s,
+               jsonb_agg(
+                   jsonb_build_object(
+                       'cert_no', h.cert_no,
+                       'delivery_position', h.delivery_position,
+                       'chain_hits', h.chain_hits
+                   ) ORDER BY h.delivery_position
+               )
+        FROM hits h
+        GROUP BY h.archive_no
+        ON CONFLICT (archive_no, batch_id) DO NOTHING
+        """,
+        (batch_id, batch_id, batch_id),
+    )
+
+
+def _notice_view(row: dict) -> dict:
+    """告知行（已 JOIN revocations 带出 revoked_cert_no / revoked_at）-> API 视图。"""
+    return {
+        "notice_id": row["notice_id"],
+        "archive_no": row["archive_no"],
+        "batch_id": row["batch_id"],
+        "revoked_cert_no": row["revoked_cert_no"],
+        "revoked_at": row["revoked_at"],
+        "affected_targets": row["affected"],
+        "created_at": row["created_at"],
+        "acknowledged_at": row["acknowledged_at"],
+    }
+
+
+def _require_invitation_key(conn, invitation_no: str, key: str) -> dict:
+    """按邀请编号 + 一次性密钥认证收件人，返回邀请行。
+
+    不校验截止时间：密钥过期（邀请截止）不影响已签收后的告知查询与确认。
+    """
+    invitation = _get_invitation_row(conn, invitation_no)
+    if invitation is None:
+        raise ApiError(
+            404, "invitation_not_found", f"签收邀请不存在: {invitation_no}"
+        )
+    if not hmac.compare_digest(invitation["key_hash"], _hash_receipt_key(key)):
+        raise ApiError(
+            401,
+            "invalid_receipt_key",
+            f"一次性签收密钥错误（邀请 {invitation_no}）",
+            details={"invitation_no": invitation_no},
+        )
+    return invitation
+
+
+def query_delivery_risk_notices(conn, req) -> dict:
+    """收件人凭定稿邀请编号 + 原一次性密钥查询归档包的全部撤销风险告知。
+
+    告知按生成顺序（notice_id 升序）返回；未签收/REJECT 或无撤销波及的包
+    返回空列表。邀请未知 404 invitation_not_found、密钥错误
+    401 invalid_receipt_key；密钥过期不影响查询。
+    """
+    invitation = _require_invitation_key(conn, req.invitation_no, req.key)
+    rows = conn.execute(
+        f"""
+        SELECT n.notice_id, n.archive_no, n.batch_id, n.affected, n.created_at,
+               n.acknowledged_at, r.cert_no AS revoked_cert_no, r.revoked_at
+        FROM delivery_risk_notices n
+        JOIN revocations r ON r.batch_id = n.batch_id
+        WHERE n.archive_no = %s
+        ORDER BY n.notice_id ASC
+        """,
+        (invitation["archive_no"],),
+    ).fetchall()
+    return {
+        "invitation_no": invitation["invitation_no"],
+        "archive_no": invitation["archive_no"],
+        "recipient": invitation["recipient"],
+        "notices": [_notice_view(r) for r in rows],
+    }
+
+
+def acknowledge_delivery_risk_notice(conn, req) -> tuple[dict, bool]:
+    """收件人确认一份撤销风险告知，返回 (告知视图, 是否首次确认)。
+
+    - 邀请/密钥校验同查询（密钥过期不影响已签收后的确认）；
+    - notice_id 不存在或不属于该邀请的归档包 → 404 notice_not_found；
+    - 首次确认写入 acknowledged_at（201）；重复确认返回 200 与首次确认时间
+      （告知行 FOR UPDATE 串行化并发确认；触发器强制确认时刻只写一次，
+      其余列只增不改）。
+    """
+    invitation = _require_invitation_key(conn, req.invitation_no, req.key)
+    with conn.transaction():
+        row = conn.execute(
+            f"""
+            SELECT n.notice_id, n.archive_no, n.batch_id, n.affected, n.created_at,
+                   n.acknowledged_at, r.cert_no AS revoked_cert_no, r.revoked_at
+            FROM delivery_risk_notices n
+            JOIN revocations r ON r.batch_id = n.batch_id
+            WHERE n.notice_id = %s AND n.archive_no = %s
+            FOR UPDATE OF n
+            """,
+            (req.notice_id, invitation["archive_no"]),
+        ).fetchone()
+        if row is None:
+            raise ApiError(
+                404,
+                "notice_not_found",
+                f"撤销风险告知不存在或不属于该邀请的归档包: {req.notice_id}",
+                details={
+                    "invitation_no": req.invitation_no,
+                    "archive_no": invitation["archive_no"],
+                    "notice_id": req.notice_id,
+                },
+            )
+        if row["acknowledged_at"] is not None:
+            # 重复确认：返回首次确认时间（并发确认在此串行化，后到者必见首次结果）
+            return _notice_view(row), False
+        acknowledged = conn.execute(
+            f"""
+            UPDATE delivery_risk_notices SET acknowledged_at = %s
+            WHERE notice_id = %s
+            RETURNING {_NOTICE_COLS}
+            """,
+            (datetime.now(timezone.utc), row["notice_id"]),
+        ).fetchone()
+    return _notice_view({**row, **acknowledged}), True
 
 
 # ---------------------------------------------------------------------------

@@ -164,6 +164,29 @@ CREATE TABLE delivery_receipts (
 );
 
 -- ----------------------------------------------------------------------------
+-- 撤销风险告知表：已签收（定稿 ACCEPT）的交付归档若受某次撤销波及，撤销事务
+-- 按归档时刻冻结的追溯链为每个受影响归档包生成一份告知（同包同批只记一份，
+-- UNIQUE 兜底）；未签收或 REJECT 的归档不生成。affected 为受影响目标及链上
+-- 命中编号明细（冻结链上命中本批被撤销证书集合的证书编号及其序位，从 1 开始）。
+-- 收件人凭定稿邀请编号与原一次性密钥查询、确认；acknowledged_at 只允许
+-- NULL -> 非空一次性写入（触发器强制），重复确认返回首次确认时间。
+-- archive_no 不建外键：告知在撤销事务（证书行 FOR UPDATE）内生成，若引用
+-- delivery_archives，插入需归档行 FOR KEY SHARE 锁，会与签收事务的加锁顺序
+-- （归档行 FOR UPDATE -> 证书链 FOR SHARE）形成等待环；归档包只增不改、
+-- 编号由生成语句直接取自 delivery_archives，引用完整性由生成逻辑保证。
+-- ----------------------------------------------------------------------------
+CREATE TABLE delivery_risk_notices (
+    notice_id    BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    archive_no   TEXT NOT NULL,                      -- 受影响归档包编号（无外键，见上注）
+    batch_id     BIGINT NOT NULL REFERENCES revocations(batch_id), -- 撤销批次
+    affected     JSONB NOT NULL,                     -- 受影响目标及链上命中编号明细
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(), -- 告知生成时刻（撤销事务内）
+    acknowledged_at TIMESTAMPTZ,                     -- 收件人确认时刻；NULL=未确认
+    UNIQUE (archive_no, batch_id)                    -- 同包同批只记一份
+);
+CREATE INDEX idx_delivery_risk_notices_archive ON delivery_risk_notices(archive_no);
+
+-- ----------------------------------------------------------------------------
 -- 更正声明表：针对已签发证书的展示字段（设备名称/操作员/备注）登记更正声明。
 -- declaration_no 为幂等键（全局唯一）；seq 为同一证书内按成功登记顺序分配的
 -- 序号（从 1 开始），合并展示时按 seq 升序逐条覆盖生效。corrections 仅保存
@@ -348,6 +371,34 @@ CREATE TRIGGER trg_delivery_receipts_no_update
 CREATE TRIGGER trg_delivery_receipts_no_delete
     BEFORE DELETE ON delivery_receipts
     FOR EACH ROW EXECUTE FUNCTION append_only_sealed();
+
+-- 撤销风险告知只允许“确认”这一次性 UPDATE：acknowledged_at 从 NULL 写入
+-- 确认时刻，其余列一律不可改；DELETE 禁止。重复确认由应用层返回首次确认时间。
+CREATE OR REPLACE FUNCTION delivery_risk_notices_ack_only() RETURNS trigger AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'delivery_risk_notices is append-only: %', OLD.notice_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    IF OLD.acknowledged_at IS NOT NULL
+       OR NEW.acknowledged_at IS NULL
+       OR NEW.notice_id  IS DISTINCT FROM OLD.notice_id
+       OR NEW.archive_no IS DISTINCT FROM OLD.archive_no
+       OR NEW.batch_id   IS DISTINCT FROM OLD.batch_id
+       OR NEW.affected   IS DISTINCT FROM OLD.affected
+       OR NEW.created_at IS DISTINCT FROM OLD.created_at
+    THEN
+        RAISE EXCEPTION 'delivery_risk_notices rows can only be acknowledged once (notice_id=%)',
+            OLD.notice_id
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_delivery_risk_notices_ack_only
+    BEFORE UPDATE OR DELETE ON delivery_risk_notices
+    FOR EACH ROW EXECUTE FUNCTION delivery_risk_notices_ack_only();
 
 -- 停用记录仅允许“解除停用”这一次性 UPDATE：从生效中（lifted_at 为 NULL）
 -- 变为已解除（lifted_at/lift_reason 写入），其余列一律不可改；DELETE 禁止。
